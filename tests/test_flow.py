@@ -40,8 +40,14 @@ class GridFlowTest(unittest.TestCase):
         plan2 = self.s.activate_plan("dispatcher", "dispatcher", plan2["id"], plan2["revision"])
         self.s.field_report("field", "field", plan2["id"], 2, "client-2", plan2["version"], "completed", "已送电")
         self.s.confirm_step("dispatcher", "dispatcher", plan2["id"], 2, "confirmed")
+        # 计划改版后旧凭证失效：v2 版本每步都必须补当前版本的完工凭证，才能发布恢复完成
+        self.s.record_voucher("field", "field", plan2["id"], 1, "start", "甲班", "SUB", "2026-09-26T09:00:00Z", "v2-s1-start", plan2["version"])
+        self.s.record_voucher("field", "field", plan2["id"], 1, "finish", "甲班", "SUB", "2026-09-26T09:20:00Z", "v2-s1-finish", plan2["version"])
+        self.s.record_voucher("field", "field", plan2["id"], 2, "start", "乙班", "LINE", "2026-09-26T09:30:00Z", "v2-s2-start", plan2["version"])
+        self.s.record_voucher("field", "field", plan2["id"], 2, "finish", "乙班", "LINE", "2026-09-26T09:50:00Z", "v2-s2-finish", plan2["version"])
         status = self.s.publish_status("dispatcher", "dispatcher", outage["id"], plan2["id"])
         self.assertEqual("restored", status["status"]["state"])
+        self.assertTrue(status["status"]["voucher_complete"])
 
     def test_anomaly_stale_report_dependency_and_permissions(self):
         outage, plan = self.plan("OUT-2")

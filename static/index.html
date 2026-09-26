@@ -1,1 +1,51 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>电网恢复调度</title>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:28px auto;padding:0 20px;color:#1f2933}
+h1{margin-bottom:4px}.muted{color:#6b7280}
+button{padding:7px 14px;cursor:pointer}
+.plan{border:1px solid #d7dde3;border-radius:8px;padding:14px 16px;margin:14px 0;background:#fff}
+.plan h3{margin:0 0 8px}
+table{border-collapse:collapse;width:100%;margin-top:8px;font-size:14px}
+th,td{border:1px solid #e3e8ee;padding:6px 9px;text-align:left;vertical-align:top}
+th{background:#f3f5f7}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}
+.ok{background:#dcf5e7;color:#176c3b}.bad{background:#fde2e2;color:#a02626}
+.reason{color:#a02626;margin:2px 0}
+.v{font-size:13px;color:#33414e}.v b{color:#111}
+pre{background:#f3f5f7;padding:12px;overflow:auto}
+</style>
+<h1>电网事故应急与恢复调度</h1>
+<p class="muted">停复电凭证：开工/完工均记录班组、设备序列与现场时刻；同一设备上一段未解除完工，下一段完工冲突不计生效；重复回传沿用首条；计划改版后旧凭证失效，当前版本每步均有有效完工凭证方可发布恢复完成。</p>
+<button onclick="load()">刷新状态</button>
+<div id="root">加载中...</div>
+<script>
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function voucherCell(v){
+  if(!v) return '<span class="tag bad">缺凭证</span>';
+  return `<div class="v">班组 <b>${esc(v.crew)}</b><br>设备 ${esc(v.asset_code)}<br>现场时刻 ${esc(v.field_time)}<br>回传 ${esc(v.received_at)}</div>`;
+}
+async function load(){
+  const state = await (await fetch('/api/state')).json();
+  const root = document.getElementById('root');
+  if(!state.plans.length){ root.textContent = '暂无计划'; return; }
+  root.innerHTML = (await Promise.all(state.plans.map(async p => {
+    const d = await (await fetch('/api/plans/' + p.id + '/vouchers')).json();
+    const rows = d.vouchers.map(v => `
+      <tr>
+        <td>${v.step_no}<br><span class="muted">${esc(v.action)}<br>${esc(v.asset)}</span></td>
+        <td>${voucherCell(v.start_voucher)}</td>
+        <td>${v.finish_effective
+            ? '<span class="tag ok">有效完工</span><br>' + voucherCell(v.finish_voucher)
+            : '<span class="tag bad">未生效</span><br>' + voucherCell(v.finish_voucher)}</td>
+        <td>${v.block_reasons.length ? v.block_reasons.map(r => `<div class="reason">▲ ${esc(r)}</div>`).join('') : '<span class="tag ok">畅通</span>'}</td>
+      </tr>`).join('');
+    return `<div class="plan"><h3>计划 #${p.id} · 事故 #${p.outage_id} · 版本 v${d.plan_version} · 状态 ${d.state}</h3>
+      <table><thead><tr><th>步骤</th><th>开工凭证</th><th>完工凭证</th><th>卡住原因</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }))).join('');
+}
+load();
+</script>
+</html>
