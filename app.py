@@ -11,6 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from archive import VoucherArchive
+from voucher_policy import VoucherPolicy
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
@@ -82,6 +85,7 @@ class Store:
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        VoucherArchive(self.conn).install()
         self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
@@ -92,7 +96,10 @@ class Store:
 
 
 class GridService:
-    def __init__(self, store: Store): self.store, self.conn = store, store.conn
+    def __init__(self, store: Store):
+        self.store, self.conn = store, store.conn
+        self.voucher_archive = VoucherArchive(self.conn)
+        self.voucher_policy = VoucherPolicy(self.voucher_archive)
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -232,6 +239,32 @@ class GridService:
             self.store.audit(actor, "field_report.received", "plan", plan_id, {"step_no": step_no, "merge_status": merge_status, "conflict": conflict})
         return dict(self._row("field_reports", cur.lastrowid))
 
+    def submit_voucher(self, actor: str | None, role: str | None, plan_id: int, step_no: int,
+                       client_voucher_id: str, kind: str, crew: str, asset_code: str,
+                       field_time: str, note: str = "") -> dict:
+        """现场回传停复电凭证（开工/完工）。判定与存档分属 policy/archive 模块；
+        重复 client_voucher_id 沿用首条记录，即使首条已被拒收也不重新判定。"""
+        actor = self._actor(actor, role, {"field"})
+        if kind not in {"start", "complete"}: raise ApiError(400, "凭证类型不合法（start/complete）")
+        if not client_voucher_id.strip(): raise ApiError(400, "缺少凭证客户端编号")
+        plan = self._row("plans", plan_id)
+        steps = json.loads(plan["steps_json"])
+        if not any(int(s["seq"]) == int(step_no) for s in steps): raise ApiError(400, "计划中没有该步骤")
+        duplicate = self.voucher_archive.get_by_client(client_voucher_id)
+        if duplicate is not None: return self._voucher_dict(duplicate, duplicate=True)
+        valid, reason = self.voucher_policy.assess(plan=plan, steps=steps, step_no=step_no, kind=kind,
+                                                   crew=crew, asset_code=asset_code, field_time=field_time)
+        with self.conn:
+            row_id = self.voucher_archive.add(client_voucher_id=client_voucher_id, plan_id=plan_id,
+                                              plan_version=int(plan["version"]), step_no=step_no, kind=kind,
+                                              crew=str(crew or "").strip(), asset_code=str(asset_code or "").strip(),
+                                              field_time=field_time, valid=valid, reject_reason=reason, note=note,
+                                              reported_by=actor, received_at=now())
+            self.store.audit(actor, "voucher.submit", "plan", plan_id,
+                             {"step_no": step_no, "kind": kind, "valid": valid, "reject_reason": reason,
+                              "client_voucher_id": client_voucher_id})
+        return self._voucher_dict(self._row("vouchers", row_id))
+
     def confirm_step(self, actor: str | None, role: str | None, plan_id: int, step_no: int, decision: str, note: str = "") -> dict:
         actor = self._actor(actor, role, {"dispatcher"})
         if decision not in {"confirmed", "blocked"}: raise ApiError(400, "确认状态不合法")
@@ -259,14 +292,22 @@ class GridService:
         confirmations = {row["step_no"]: dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=?", (plan_id,))}
         steps = json.loads(plan["steps_json"])
         completed = sum(1 for step in steps if confirmations.get(int(step["seq"]), {}).get("status") == "confirmed")
+        all_confirmed = completed == len(steps)
+        step_vouchers = self.voucher_policy.step_view(plan=plan, steps=steps)
+        # “恢复完成”闸门：当前激活计划每一步都必须持有当前版本的有效完工凭证。
+        voucher_blockers = self.voucher_policy.publish_gate(plan, steps) if all_confirmed else []
+        if all_confirmed and voucher_blockers:
+            raise ApiError(409, "仍有步骤缺少有效完工凭证，不能发布恢复完成：" + "；".join(voucher_blockers))
+        state = "restored" if all_confirmed else "restoring"
         status = {"outage_id": outage_id, "incident_code": outage["incident_code"], "plan_id": plan_id, "plan_version": plan["version"],
-                  "state": "restored" if completed == len(steps) else "restoring", "completed_steps": completed, "total_steps": len(steps),
+                  "state": state, "completed_steps": completed, "total_steps": len(steps),
+                  "voucher_blockers": voucher_blockers,
                   "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"]}
         with self.conn:
             cur = self.conn.execute("INSERT INTO published_status(outage_id,plan_id,version,status_json,created_at) VALUES(?,?,?,?,?)",
                                     (outage_id, plan_id, plan["version"], j(status), now()))
-            if status["state"] == "restored": self.conn.execute("UPDATE outages SET state='restored',revision=revision+1,updated_at=? WHERE id=?", (now(), outage_id))
-            self.store.audit(actor, "status.publish", "outage", outage_id, {"plan_id": plan_id, "state": status["state"]})
+            if state == "restored": self.conn.execute("UPDATE outages SET state='restored',revision=revision+1,updated_at=? WHERE id=?", (now(), outage_id))
+            self.store.audit(actor, "status.publish", "outage", outage_id, {"plan_id": plan_id, "state": state})
         return {"id": cur.lastrowid, "status": status}
 
     def _validate_steps(self, steps: list[dict]) -> list[dict]:
@@ -310,9 +351,14 @@ class GridService:
             self.store.audit(actor, action, "plan", plan["id"], details)
 
     def plan_detail(self, plan_id: int) -> dict:
-        plan = self._plan_dict(self._row("plans", plan_id))
+        plan_row = self._row("plans", plan_id)
+        plan = self._plan_dict(plan_row)
+        steps = plan["steps"]
         return {"plan": plan, "confirmations": [dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (plan_id,))],
-                "field_reports": [dict(row) for row in self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? ORDER BY id", (plan_id,))]}
+                "field_reports": [dict(row) for row in self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? ORDER BY id", (plan_id,))],
+                "vouchers": [self._voucher_dict(row) for row in self.voucher_archive.list_for_plan(plan_id)],
+                "step_vouchers": self.voucher_policy.step_view(plan=plan_row, steps=steps),
+                "publish_blockers": self.voucher_policy.publish_gate(plan_row, steps) if plan_row["state"] in {"active", "superseded"} else []}
 
     def _outage_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "incident_code": row["incident_code"], "title": row["title"], "state": row["state"],
@@ -321,6 +367,14 @@ class GridService:
     def _plan_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "outage_id": row["outage_id"], "version": row["version"], "state": row["state"],
                 "steps": json.loads(row["steps_json"]), "revision": row["revision"]}
+
+    def _voucher_dict(self, row: sqlite3.Row, duplicate: bool = False) -> dict:
+        return {"id": row["id"], "client_voucher_id": row["client_voucher_id"], "plan_id": row["plan_id"],
+                "plan_version": row["plan_version"], "step_no": row["step_no"], "kind": row["kind"],
+                "crew": row["crew"], "asset_code": row["asset_code"], "field_time": row["field_time"],
+                "valid": bool(row["valid"]), "reject_reason": row["reject_reason"], "note": row["note"],
+                "reported_by": row["reported_by"], "received_at": row["received_at"],
+                "duplicate": duplicate}
 
     def state(self) -> dict:
         return {"assets": [dict(row) for row in self.conn.execute("SELECT * FROM assets ORDER BY id")],
@@ -375,6 +429,7 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "activate": out = self.service.activate_plan(actor, role, int(p[2]), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "change": out = self.service.make_plan_change(actor, role, int(p[2]), b.get("steps", []), int(b.get("expected_revision", -1)))
             elif p == ["api", "field-reports"]: out = self.service.field_report(actor, role, int(b.get("plan_id", 0)), int(b.get("step_no", 0)), b.get("client_report_id", ""), int(b.get("expected_plan_version", 0)), b.get("status", ""), b.get("note", ""))
+            elif p == ["api", "vouchers"]: out = self.service.submit_voucher(actor, role, int(b.get("plan_id", 0)), int(b.get("step_no", 0)), b.get("client_voucher_id", ""), b.get("kind", ""), b.get("crew", ""), b.get("asset_code", ""), b.get("field_time", ""), b.get("note", ""))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "confirm": out = self.service.confirm_step(actor, role, int(p[2]), int(b.get("step_no", 0)), b.get("decision", "confirmed"), b.get("note", ""))
             elif p == ["api", "status"]: out = self.service.publish_status(actor, role, int(b.get("outage_id", 0)), int(b.get("plan_id", 0)))
             else: raise ApiError(404, "接口不存在")
